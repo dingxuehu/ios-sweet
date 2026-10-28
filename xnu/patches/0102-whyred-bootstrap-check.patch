@@ -1,11 +1,12 @@
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -828,6 +828,61 @@
+@@ -828,6 +828,62 @@
  #endif /* HAS_APPLE_PAC */
  
  	// Enable caches, MMU, ROP and JOP
 +#if defined(SWEET)
++	/* whyred: table self-check, round 1 (see 0102 docstring). */
 +	/*
 +	 * whyred: walk the bootstrap tables by hand (MMU still off) and show the
 +	 * result as green/red bands, so a broken mapping is visible instead of
