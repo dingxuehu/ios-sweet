@@ -1,7 +1,7 @@
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -831,6 +831,23 @@
+@@ -831,6 +831,24 @@
  #if defined(SWEET)
  	/* whyred C5: about to enable the MMU (orange) */
  	SWEET_BAND 340, 0xffff8000
@@ -14,7 +14,8 @@ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 +	 * would read those. With the MMU off VA == PA, so invalidate by VA.
 +	 */
 +	mov		x9, x23					// physical base of the mach header
-+	add		x10, x9, #0x2000, lsl #12
++	MOV64	x10, 0x2000000
++	add		x10, x9, x10
 +9:	dc		ivac, x9
 +	add		x9, x9, #64
 +	cmp		x9, x10
