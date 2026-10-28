@@ -14,7 +14,7 @@ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 +	 * would read those. With the MMU off VA == PA, so invalidate by VA.
 +	 */
 +	mov		x9, x23					// physical base of the mach header
-+	add		x10, x9, #(32 << 20)
++	add		x10, x9, #0x2000, lsl #12
 +9:	dc		ivac, x9
 +	add		x9, x9, #64
 +	cmp		x9, x10
