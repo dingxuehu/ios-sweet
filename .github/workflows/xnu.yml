@@ -115,10 +115,16 @@ jobs:
           cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
           ls -la out
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+          # whyred: a 17 MB Mach-O takes ~25 min over the phone-side link;
+          # ship the kernel gzipped (~6 MB) and keep the checksums next to it.
+          gzip -9 -k out/kernel.* || true
+          ls -la out/*.gz
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: xnu-kernel
-          path: out/
+          path: |
+            out/*.gz
+            out/SHA256SUMS
           if-no-files-found: warn
