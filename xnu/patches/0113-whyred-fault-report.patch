@@ -1,0 +1,298 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -1314,6 +1314,85 @@
+ 	SWEET_BAND 360, 0xff7fff00
+ #endif
+ #if defined(SWEET)
++	/*
++	 * whyred 0113: is the V=P block that contains this very code executable?
++	 *
++	 * 0112 established that L2[88] has the right type and that AT S1E1R can
++	 * walk the code's own address, but AT S1E1R tests DATA READ permission at
++	 * EL1: it says nothing at all about instruction-fetch permission, which is
++	 * what PXN (bit 53, privileged execute-never) and NX (bit 54) control.  A
++	 * block with PXN set faults the very first fetch after SCTLR_EL1.M goes to
++	 * 1 -- exactly where this port dies -- and with VBAR_EL1 still zero the
++	 * vector fetch faults in turn, so the core locks up with nothing on the
++	 * panel.  That is the one failure mode that fits every measurement so far.
++	 *
++	 * So paint the three bits, then clear NX and PXN on that block: a no-op if
++	 * they were already clear, and this run is a diagnostic either way.
++	 *
++	 * x25 is the physical address of the V=P L1 root (0106 already reads [x25]
++	 * as "the real L1 entry for the framebuffer").  With a 16KB granule and
++	 * T0SZ=17, L1[0] spans 0x0..0xFFFFFFFF and each L2 entry is 32MB, so the
++	 * kernel's block at 0xB0000000 is index 88.  Only x4..x11 are touched, and
++	 * SWEET_BAND_V clobbers only x6..x11, so the descriptor (x4) and the L2
++	 * table (x5) survive the band calls.
++	 */
++	ldr		x4, [x25]			/* L1[0] */
++	and		x5, x4, #(ARM_TTE_TABLE_MASK)	/* -> the V=P L2 table */
++	ldr		x4, [x5, #(88 * 8)]		/* the kernel's 32MB block */
++	/* 1640: valid|block, the property 0112 already confirmed (green) */
++	MOV64	x7, 0xff00ff00
++	MOV64	x8, 0xff000000
++	and		x9, x4, #0x3
++	cmp		x9, #0x1
++	csel	x10, x7, x8, eq
++	SWEET_BAND_V 1640, x10
++	/* 1680: PXN set?  green here means it was the killer */
++	MOV64	x7, 0xff00ff00
++	MOV64	x8, 0xff000000
++	MOV64	x9, 0x0020000000000000
++	tst		x4, x9
++	csel	x10, x7, x8, ne
++	SWEET_BAND_V 1680, x10
++	/* 1720: NX set? */
++	MOV64	x7, 0xff00ff00
++	MOV64	x8, 0xff000000
++	MOV64	x9, 0x0040000000000000
++	tst		x4, x9
++	csel	x10, x7, x8, ne
++	SWEET_BAND_V 1720, x10
++	/* 1760: AP[2] set, i.e. the block is read-only? */
++	MOV64	x7, 0xff00ff00
++	MOV64	x8, 0xff000000
++	tst		x4, #0x80
++	csel	x10, x7, x8, ne
++	SWEET_BAND_V 1760, x10
++	/* Make that block executable and publish the change to the walker. */
++	MOV64	x7, 0xffdfffffffffffff		/* ~(1 << 53): clear PXN */
++	and		x4, x4, x7
++	MOV64	x7, 0xffbfffffffffffff		/* ~(1 << 54): clear NX */
++	and		x4, x4, x7
++	str		x4, [x5, #(88 * 8)]
++	dsb		sy
++	tlbi		vmalle1
++	dsb		sy
++	isb		sy
++	/*
++	 * whyred 0113: install a fault reporter BEFORE translation is enabled.
++	 * The kernel's real vectors are not installed until after the two SCTLR
++	 * writes below, so at the instant MMU-on happens VBAR_EL1 still holds
++	 * whatever the shim or ABL left there -- normally 0.  If the first
++	 * translated access faults, the CPU vectors to that address, the vector
++	 * fetch faults in turn, and the core is gone with nothing on the panel.
++	 * adr, not adrp: with the MMU still off the code runs at its physical
++	 * address, so adr yields exactly the value a V=P-mapped VBAR_EL1 needs.
++	 * 0112 proved this works here: its own-PC AT probe used adr and both of
++	 * its bands came out green.
++	 */
++	adr		x0, .Lw0113_vectors
++	MSR_VBAR_EL1_X0
++	isb		sy
++#endif
++#if defined(SWEET)
+ 	/* whyred 1/2: translation only, I and C still off. */
+ 	MOV64	x0, (SCTLR_EL1_DEFAULT & ~(SCTLR_C_ENABLED | SCTLR_I_ENABLED))
+ #else
+@@ -1469,6 +1548,208 @@
+ 	/* Return to arm_init() */
+ 	ret
+ 
++/*
++ * whyred 0113: the fault reporter.  All 16 vector entries branch here.
++ *
++ * The handler may be entered with a translation regime that has just failed,
++ * so it reads the syndrome first, then immediately turns the MMU off so that
++ * VA == PA again, and only then writes its report straight to the framebuffer
++ * at the same absolute physical address every other SWEET band uses.
++ *
++ * Band map, left edge, 32 rows each:
++ *   860  white    the reporter ran at all
++ *   900  colour   ESR_EL1.EC: magenta = instruction abort, cyan = data abort,
++ *                 yellow = trapped system register, blue = illegal execution
++ *                 state, green = something else
++ *   940  colour   ESR_EL1[5:2]: white = translation fault, cyan = permission
++ *                 fault, yellow = address size fault, green = access flag
++ *                 fault, blue = other
++ *   980  colour   ESR_EL1[1:0]: white = level 0, green = level 1,
++ *                 cyan = level 2, yellow = level 3
++ *   1140 green    FAR_EL1 in the framebuffer's 16MB (0x9d......)
++ *   1180 green    FAR_EL1 in the kernel image's 16MB (0xb1......)
++ *   1220 green    FAR_EL1 below 64KB, i.e. something vectored to zero
++ *   1260 green    FAR_EL1 in this vector table's own page
++ *   1300..1580    FAR_EL1[39:32], MSB first: green = 1, black = 0
++ *   1620 green    ESR_EL1.WnR, the faulting access was a write
++ *   1660 green    ELR_EL1 in the kernel image's 16MB, the fault is ours
++ *
++ * x12..x15 carry the captured registers across the band calls because
++ * SWEET_BAND_V only ever uses x6..x11; those are reloaded for every band.
++ */
++	.align 11				/* VBAR_EL1 requires 2KB alignment */
++.Lw0113_vectors:
++	.rept 16
++	b		.Lw0113_report
++	.space 0x7c, 0
++	.endr
++
++.Lw0113_report:
++	mrs		x12, esr_el1			/* capture before anything else */
++	mrs		x13, far_el1
++	mrs		x14, elr_el1
++	mrs		x15, spsr_el1
++	mrs		x9, sctlr_el1
++	bic		x9, x9, #1			/* SCTLR_EL1.M = 0 */
++	msr		sctlr_el1, x9
++	isb		sy
++	/* 860: did the reporter run? */
++	MOV64	x6, 0xffffffff
++	SWEET_BAND_V 860, x6
++	/* 900: exception class */
++	ubfx	x9, x12, #26, #6
++	MOV64	x7, 0xffff00ff			/* magenta: instruction abort */
++	MOV64	x8, 0xff00ffff			/* cyan:    data abort */
++	MOV64	x10, 0xffffff00			/* yellow:  trapped system register */
++	MOV64	x11, 0xff0000ff			/* blue:    illegal execution state */
++	MOV64	x6, 0xff00ff00			/* green:   something else */
++	cmp		x9, #0x20
++	csel	x6, x7, x6, eq
++	cmp		x9, #0x21
++	csel	x6, x7, x6, eq
++	cmp		x9, #0x24
++	csel	x6, x8, x6, eq
++	cmp		x9, #0x25
++	csel	x6, x8, x6, eq
++	cmp		x9, #0x18
++	csel	x6, x10, x6, eq
++	cmp		x9, #0x0e
++	csel	x6, x11, x6, eq
++	SWEET_BAND_V 900, x6
++	/* 940: fault status class */
++	ubfx	x9, x12, #2, #4
++	MOV64	x7, 0xffffffff			/* white:  translation fault */
++	MOV64	x8, 0xff00ffff			/* cyan:   permission fault */
++	MOV64	x10, 0xffffff00			/* yellow: address size fault */
++	MOV64	x11, 0xff00ff00			/* green:  access flag fault */
++	MOV64	x6, 0xff0000ff			/* blue:   other */
++	cmp		x9, #0x4
++	csel	x6, x7, x6, eq
++	cmp		x9, #0xc
++	csel	x6, x8, x6, eq
++	cmp		x9, #0x0
++	csel	x6, x10, x6, eq
++	cmp		x9, #0x8
++	csel	x6, x11, x6, eq
++	SWEET_BAND_V 940, x6
++	/* 980: fault level */
++	and		x9, x12, #3
++	MOV64	x7, 0xffffffff			/* white:  level 0 */
++	MOV64	x8, 0xff00ff00			/* green:  level 1 */
++	MOV64	x10, 0xff00ffff			/* cyan:   level 2 */
++	MOV64	x11, 0xffffff00			/* yellow: level 3 */
++	mov		x6, x7
++	cmp		x9, #1
++	csel	x6, x8, x6, eq
++	cmp		x9, #2
++	csel	x6, x10, x6, eq
++	cmp		x9, #3
++	csel	x6, x11, x6, eq
++	SWEET_BAND_V 980, x6
++	/* 1140: is the faulting address in the framebuffer's 16MB? */
++	MOV64	x7, 0xff00ff00
++	MOV64	x8, 0xff000000
++	lsr		x9, x13, #24
++	cmp		x9, #0x9d
++	csel	x6, x7, x8, eq
++	SWEET_BAND_V 1140, x6
++	/* 1180: is it in the kernel image's 16MB? */
++	MOV64	x7, 0xff00ff00
++	MOV64	x8, 0xff000000
++	lsr		x9, x13, #24
++	cmp		x9, #0xb1
++	csel	x6, x7, x8, eq
++	SWEET_BAND_V 1180, x6
++	/* 1220: is it below 64KB? */
++	MOV64	x7, 0xff00ff00
++	MOV64	x8, 0xff000000
++	lsr		x9, x13, #16
++	cmp		x9, #0
++	csel	x6, x7, x8, eq
++	SWEET_BAND_V 1220, x6
++	/* 1260: is it in this vector table's own page? */
++	MOV64	x7, 0xff00ff00
++	MOV64	x8, 0xff000000
++	adr		x10, .Lw0113_vectors
++	lsr		x9, x13, #12
++	lsr		x10, x10, #12
++	cmp		x9, x10
++	csel	x6, x7, x8, eq
++	SWEET_BAND_V 1260, x6
++	/* 1300..1580: FAR_EL1[39:32], most significant bit first */
++	/* 1300: FAR_EL1 bit 39 */
++	MOV64	x7, 0xff00ff00
++	MOV64	x8, 0xff000000
++	ubfx	x9, x13, #39, #1
++	cmp		x9, #0
++	csel	x6, x7, x8, ne
++	SWEET_BAND_V 1300, x6
++	/* 1340: FAR_EL1 bit 38 */
++	MOV64	x7, 0xff00ff00
++	MOV64	x8, 0xff000000
++	ubfx	x9, x13, #38, #1
++	cmp		x9, #0
++	csel	x6, x7, x8, ne
++	SWEET_BAND_V 1340, x6
++	/* 1380: FAR_EL1 bit 37 */
++	MOV64	x7, 0xff00ff00
++	MOV64	x8, 0xff000000
++	ubfx	x9, x13, #37, #1
++	cmp		x9, #0
++	csel	x6, x7, x8, ne
++	SWEET_BAND_V 1380, x6
++	/* 1420: FAR_EL1 bit 36 */
++	MOV64	x7, 0xff00ff00
++	MOV64	x8, 0xff000000
++	ubfx	x9, x13, #36, #1
++	cmp		x9, #0
++	csel	x6, x7, x8, ne
++	SWEET_BAND_V 1420, x6
++	/* 1460: FAR_EL1 bit 35 */
++	MOV64	x7, 0xff00ff00
++	MOV64	x8, 0xff000000
++	ubfx	x9, x13, #35, #1
++	cmp		x9, #0
++	csel	x6, x7, x8, ne
++	SWEET_BAND_V 1460, x6
++	/* 1500: FAR_EL1 bit 34 */
++	MOV64	x7, 0xff00ff00
++	MOV64	x8, 0xff000000
++	ubfx	x9, x13, #34, #1
++	cmp		x9, #0
++	csel	x6, x7, x8, ne
++	SWEET_BAND_V 1500, x6
++	/* 1540: FAR_EL1 bit 33 */
++	MOV64	x7, 0xff00ff00
++	MOV64	x8, 0xff000000
++	ubfx	x9, x13, #33, #1
++	cmp		x9, #0
++	csel	x6, x7, x8, ne
++	SWEET_BAND_V 1540, x6
++	/* 1580: FAR_EL1 bit 32 */
++	MOV64	x7, 0xff00ff00
++	MOV64	x8, 0xff000000
++	ubfx	x9, x13, #32, #1
++	cmp		x9, #0
++	csel	x6, x7, x8, ne
++	SWEET_BAND_V 1580, x6
++	/* 1620: was the faulting access a write? */
++	MOV64	x7, 0xff00ff00
++	MOV64	x8, 0xff000000
++	ubfx	x9, x12, #6, #1
++	cmp		x9, #0
++	csel	x6, x7, x8, ne
++	SWEET_BAND_V 1620, x6
++	/* 1660: was the interrupted PC in the kernel image? */
++	MOV64	x7, 0xff00ff00
++	MOV64	x8, 0xff000000
++	lsr		x9, x14, #24
++	cmp		x9, #0xb1
++	csel	x6, x7, x8, eq
++	SWEET_BAND_V 1660, x6
++.Lw0113_hang:
++	wfi
++	b		.Lw0113_hang
+ //#include	"globals_asm.h"
+ 
+ /* vim: set ts=4: */
